@@ -34,6 +34,11 @@ class ResolveRequest(BaseModel):
     version: int = Field(ge=1, description="已发布版本号")
 
 
+class PreviewRequest(BaseModel):
+    baseline_version: int = Field(ge=1, description="作为基线的已发布版本号")
+    revision: int = Field(ge=0, description="客户端所见草稿修订号")
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

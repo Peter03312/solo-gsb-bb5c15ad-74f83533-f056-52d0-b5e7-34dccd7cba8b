@@ -7,8 +7,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from . import db, store
-from .models import DraftUpdate, PublishRequest, ResolveRequest, ValidationFailure, normalize_rules
-from .routing import ResolutionError, RuleSet, is_valid_address, resolve, validate_ruleset
+from .models import (
+    DraftUpdate,
+    PreviewRequest,
+    PublishRequest,
+    ResolveRequest,
+    ValidationFailure,
+    normalize_rules,
+)
+from .routing import ResolutionError, RuleSet, diff_rulesets, is_valid_address, resolve, validate_ruleset
 
 
 @asynccontextmanager
@@ -119,4 +126,32 @@ def resolve_address(body: ResolveRequest) -> dict:
             {"mailbox": mailbox, "paths": sorted(paths)}
             for mailbox, paths in sorted(endpoints.items())
         ],
+    }
+
+
+@app.post("/preview")
+def preview_changes(body: PreviewRequest) -> dict:
+    """预览当前草稿相对基线版本的投递变化（只读，不改动草稿或历史版本）。
+
+    同一读取快照内取出草稿与基线版本两份规则；草稿未通过发布校验时，
+    相应地址的草稿侧照常展示失败结果，而不是拒绝预览。
+    """
+    try:
+        with db.read_snapshot() as conn:
+            revision, draft_rules = store.get_draft(conn)
+            if revision != body.revision:
+                raise store.RevisionConflict(revision)
+            baseline = store.get_version(conn, body.baseline_version)
+            if baseline is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={"error": "version_not_found", "version": body.baseline_version},
+                )
+    except store.RevisionConflict as exc:
+        raise _conflict(exc)
+    diff = diff_rulesets(RuleSet(baseline["rules"]), RuleSet(draft_rules))
+    return {
+        "baseline_version": body.baseline_version,
+        "revision": revision,
+        **diff,
     }

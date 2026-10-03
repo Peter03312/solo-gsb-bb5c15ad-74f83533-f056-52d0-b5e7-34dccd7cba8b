@@ -15,6 +15,8 @@
 - **发布**：在单个事务（`BEGIN IMMEDIATE`）内原子核对修订号，并校验**所有规则目标可解析且无环**；
   成功则生成不可变版本，失败则保持旧版本不变。
 - **历史版本**：所有发布版本永久可查，按任意历史版本解析可复现当时的结果。
+- **投递预览**：`POST /preview` 在同一读取快照内比较当前草稿与某个已发布版本，
+  只列出投递结果有变化的地址与域兜底类别，并给出两侧完整结果；只读，不改动草稿或历史版本。
 
 ## 一键启动（Docker Compose）
 
@@ -61,6 +63,7 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/versions`       | 列出全部已发布版本                     |
 | GET  | `/versions/{n}`   | 查看某个历史版本的完整规则             |
 | POST | `/resolve`        | 按指定版本解析收件地址                 |
+| POST | `/preview`        | 预览草稿相对基线版本的投递变化（只读） |
 
 ## 调用示例
 
@@ -151,6 +154,75 @@ curl http://localhost:8000/versions/1      # 某版本的完整规则快照
 ```
 
 草稿后续修改、发布新版本后，仍可用 `"version": 1` 调 `/resolve` 复现当时的判定结果。
+
+### 5. 发布前预览：草稿相对某版本的投递变化
+
+接着上面的例子：v1 已发布，管理员把 `blocked@corp.example.com` 从拒收改为投递
+（草稿修订号 1 → 2），发布前先用 `/preview` 核对投递变化：
+
+```bash
+curl -X PUT http://localhost:8000/draft -H 'Content-Type: application/json' -d '{
+  "revision": 1,
+  "rules": [
+    {"match_type": "exact", "match_key": "boss@corp.example.com", "action": "route", "targets": [
+      {"kind": "alias",   "value": "assistant@corp.example.com"},
+      {"kind": "mailbox", "value": "boss-backup@mail.example.com"}
+    ]},
+    {"match_type": "exact", "match_key": "assistant@corp.example.com", "action": "route", "targets": [
+      {"kind": "mailbox", "value": "alice@mail.example.com"},
+      {"kind": "alias",   "value": "team@corp.example.com"}
+    ]},
+    {"match_type": "exact", "match_key": "team@corp.example.com", "action": "route", "targets": [
+      {"kind": "mailbox", "value": "alice@mail.example.com"},
+      {"kind": "mailbox", "value": "bob@mail.example.com"}
+    ]},
+    {"match_type": "exact", "match_key": "blocked@corp.example.com", "action": "route", "targets": [
+      {"kind": "mailbox", "value": "blocked@mail.example.com"}
+    ]},
+    {"match_type": "domain", "match_key": "corp.example.com", "action": "route", "targets": [
+      {"kind": "mailbox", "value": "catchall@mail.example.com"}
+    ]}
+  ]}'
+
+curl -X POST http://localhost:8000/preview -H 'Content-Type: application/json' \
+  -d '{"baseline_version": 1, "revision": 2}'
+```
+
+响应只列出结果有变化的项，两侧完整结果一并给出（`baseline` / `draft`）：
+
+```json
+{
+  "baseline_version": 1,
+  "revision": 2,
+  "changed_addresses": [
+    {
+      "address": "blocked@corp.example.com",
+      "baseline": {"status": "failed", "error": {
+        "error": "rejected", "message": "blocked@corp.example.com rejected by rule",
+        "address": "blocked@corp.example.com", "chain": ["blocked@corp.example.com"]
+      }},
+      "draft": {"status": "ok", "endpoints": [
+        {"mailbox": "blocked@mail.example.com",
+         "paths": [["blocked@corp.example.com", "blocked@mail.example.com"]]}
+      ]}
+    }
+  ],
+  "changed_domain_fallbacks": []
+}
+```
+
+语义说明：
+
+- **探测范围**：两侧全部精确规则地址 ∪ 全部别名目标（与发布校验同一套种子），
+  别名下游的变化会追溯到引用它的入口地址一并列出；两侧出现过域规则的每个域，
+  排除前述具体地址后的兜底地址类别用一个避开两侧精确地址与别名目标的示例地址
+  （如 `preview-probe@corp.example.com`）代表，变化列在 `changed_domain_fallbacks`。
+- **比较口径**：沿用现有精确优先、逐跳展开、整次失败语义；终点、到达路径、
+  拒收 / 无路由 / 成环任一不同即列出，路径排列顺序不计差异。
+- **草稿未通过发布校验**（存在无路由 / 成环）时预览仍返回 `200`，
+  相应地址的 `draft` 侧展示 `failed` 结果，便于发布前定位问题。
+- **只读**：预览不改动草稿或历史版本。修订号过期返回 `409`
+  （`revision_conflict`），基线版本不存在返回 `404`（`version_not_found`）。
 
 ## 项目结构
 

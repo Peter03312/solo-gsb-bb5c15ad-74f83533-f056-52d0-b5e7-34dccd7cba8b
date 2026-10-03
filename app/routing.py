@@ -134,3 +134,64 @@ def validate_ruleset(ruleset: RuleSet) -> list[dict]:
         except ResolutionError as exc:
             problems.append({"seed": seed, **exc.detail()})
     return problems
+
+
+# ---------- 投递变化预览：当前草稿 vs 基线版本 ----------
+
+
+def _outcome(address: str, ruleset: RuleSet) -> dict:
+    """单个地址在一套规则下的完整解析结果，用于两侧对比。
+
+    成功为去重后的终点及全部到达路径；失败为 rejected / no_route / cycle 详情
+    （与 /resolve 的 422 detail 同构）。路径排序后比较，排列顺序不计差异。
+    """
+    try:
+        endpoints = resolve(address, ruleset)
+    except ResolutionError as exc:
+        return {"status": "failed", "error": exc.detail()}
+    return {
+        "status": "ok",
+        "endpoints": [
+            {"mailbox": mailbox, "paths": sorted(paths)}
+            for mailbox, paths in sorted(endpoints.items())
+        ],
+    }
+
+
+def _fallback_sample(domain: str, taken: set[str]) -> str:
+    """域兜底类别的示例地址：避开两侧全部精确规则地址与别名目标。"""
+    suffix = 0
+    while True:
+        local = "preview-probe" if suffix == 0 else f"preview-probe-{suffix}"
+        candidate = f"{local}@{domain}"
+        if candidate not in taken:
+            return candidate
+        suffix += 1
+
+
+def diff_rulesets(baseline: RuleSet, draft: RuleSet) -> dict:
+    """比较两份规则快照（基线版本 vs 当前草稿）的投递结果，仅列出有变化的项。
+
+    - 探测地址 = 两侧全部精确规则地址 ∪ 全部别名目标（与发布校验同一套种子），
+      别名下游的变化因此会追溯到引用它的入口地址；
+    - 两侧出现过域规则的每个域，排除前述具体地址后的兜底地址类别用一个
+      避开全部具体地址的示例地址代表；
+    - 终点、到达路径、拒收 / 无路由 / 成环任一不同即视为变化；路径排列顺序不计。
+    """
+    seeds = sorted(set(validation_seeds(baseline)) | set(validation_seeds(draft)))
+    changed_addresses = []
+    for address in seeds:
+        before, after = _outcome(address, baseline), _outcome(address, draft)
+        if before != after:
+            changed_addresses.append({"address": address, "baseline": before, "draft": after})
+
+    taken = set(seeds)
+    changed_domain_fallbacks = []
+    for domain in sorted(set(baseline.domain) | set(draft.domain)):
+        sample = _fallback_sample(domain, taken)
+        before, after = _outcome(sample, baseline), _outcome(sample, draft)
+        if before != after:
+            changed_domain_fallbacks.append(
+                {"domain": domain, "sample_address": sample, "baseline": before, "draft": after}
+            )
+    return {"changed_addresses": changed_addresses, "changed_domain_fallbacks": changed_domain_fallbacks}
