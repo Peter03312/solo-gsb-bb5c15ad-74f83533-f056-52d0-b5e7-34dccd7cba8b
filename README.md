@@ -15,6 +15,8 @@
 - **发布**：在单个事务（`BEGIN IMMEDIATE`）内原子核对修订号，并校验**所有规则目标可解析且无环**；
   成功则生成不可变版本，失败则保持旧版本不变。
 - **历史版本**：所有发布版本永久可查，按任意历史版本解析可复现当时的结果。
+- **发布前预览**：`POST /preview` 在同一只读快照内对比当前草稿与某个已发布版本，
+  列出投递结果有变化的入口地址与域兜底类别（附两侧完整结果）；只读，不改动草稿或历史版本。
 
 ## 一键启动（Docker Compose）
 
@@ -61,6 +63,7 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/versions`       | 列出全部已发布版本                     |
 | GET  | `/versions/{n}`   | 查看某个历史版本的完整规则             |
 | POST | `/resolve`        | 按指定版本解析收件地址                 |
+| POST | `/preview`        | 预览当前草稿相对基线版本的投递变化     |
 
 ## 调用示例
 
@@ -152,16 +155,71 @@ curl http://localhost:8000/versions/1      # 某版本的完整规则快照
 
 草稿后续修改、发布新版本后，仍可用 `"version": 1` 调 `/resolve` 复现当时的判定结果。
 
+### 5. 发布前预览：草稿 vs 基线版本
+
+管理员在发布前用 `POST /preview` 对比**当前草稿**与某个**已发布版本**的投递差异。
+请求携带基线版本号与所见草稿修订号：
+
+```bash
+curl -X POST http://localhost:8000/preview -H 'Content-Type: application/json' \
+  -d '{"base_version": 1, "revision": 2}'
+```
+
+服务在同一只读事务快照内取出两份规则集（不改动草稿或历史版本），沿用与 `/resolve`
+相同的精确优先、逐跳展开、整次失败语义做全量对比，只列出**结果有变化**的项：
+
+- `changed_addresses`：两侧全部**精确规则地址与别名目标**（并集）中结果有变化的地址。
+  别名下游的变化会追溯到受影响的入口——例如 `team@` 改投后，`boss@`、`assistant@`
+  这些经由它的入口也会列出。每项附 `base` / `draft` 两侧的完整结果：
+  成功为 `{"status": "ok", "endpoints": [...]}`（形状同 `/resolve` 响应），
+  失败为 `{"status": "failed", "error": {...}}`（形状同 `/resolve` 的 422 详情）。
+- `changed_domain_fallbacks`：两侧任一处出现过域规则的每个域，排除上述具体地址后的
+  **兜底地址类别**。每类用一个避开两侧精确地址与别名目标的合成示例地址
+  （如 `_preview-sample@corp.example.com`）代表，同样附两侧完整结果。
+
+比较时**路径排列顺序不计差异**（按路径集合比较），仅终点集合、到达路径或
+拒收 / 无路由 / 成环结果不同才列出；无变化时两个列表均为空。
+草稿尚未通过发布校验（如有环、目标无路由）时预览仍正常返回，对应入口展示失败结果。
+
+```json
+{
+  "base_version": 1,
+  "revision": 2,
+  "changed_addresses": [
+    {
+      "address": "team@corp.example.com",
+      "base":  {"status": "ok", "endpoints": [{"mailbox": "alice@mail.example.com", "paths": [["team@corp.example.com", "alice@mail.example.com"]]}, {"mailbox": "bob@mail.example.com", "paths": [["team@corp.example.com", "bob@mail.example.com"]]}]},
+      "draft": {"status": "ok", "endpoints": [{"mailbox": "carol@mail.example.com", "paths": [["team@corp.example.com", "carol@mail.example.com"]]}]}
+    }
+  ],
+  "changed_domain_fallbacks": [
+    {
+      "domain": "corp.example.com",
+      "sample": "_preview-sample@corp.example.com",
+      "base":  {"status": "ok", "endpoints": [{"mailbox": "catchall@mail.example.com", "paths": [["_preview-sample@corp.example.com", "catchall@mail.example.com"]]}]},
+      "draft": {"status": "ok", "endpoints": [{"mailbox": "new-catchall@mail.example.com", "paths": [["_preview-sample@corp.example.com", "new-catchall@mail.example.com"]]}]}
+    }
+  ]
+}
+```
+
+错误契约与既有接口一致：修订号过期返回 `409`（`revision_conflict`，附当前修订号），
+基线版本不存在返回 `404`（`version_not_found`）。
+
+> 上例为节选：该场景下 `boss@`、`assistant@` 等经由 `team@` 的入口也会一并出现在
+> `changed_addresses` 中。
+
 ## 项目结构
 
 ```
 app/
   config.py    # 环境变量配置
-  db.py        # SQLite 连接、建表、BEGIN IMMEDIATE 事务
+  db.py        # SQLite 连接、建表、BEGIN IMMEDIATE 事务、只读快照事务
   routing.py   # 地址校验、规则集、逐跳解析、发布前全量校验
+  preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标）
   store.py     # 草稿与版本的持久化、修订号核对
   main.py      # FastAPI 路由
-tests/         # pytest：API 全流程 + 解析单元测试
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览
 Dockerfile / docker-compose.yml
 ```

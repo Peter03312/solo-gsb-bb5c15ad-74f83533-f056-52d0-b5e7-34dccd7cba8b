@@ -69,3 +69,18 @@ def transaction():
         raise
     finally:
         conn.close()
+
+
+@contextmanager
+def read_transaction():
+    """只读事务：同一快照内完成多次读取（如草稿 + 基线版本），期间不受并发写影响。"""
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        yield conn
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
